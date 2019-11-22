@@ -3,6 +3,7 @@ import time
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.wait import WebDriverWait
 
 
 class GurlDownSelenium:
@@ -33,22 +34,63 @@ class GurlDownSelenium:
                                   chrome_options=chrome_options
                                   )
         driver.get(self.url)
-        if driver.title == 'Not Found':
-            print("File doesn't exist! Continuing with next request...\n")
-        elif driver.title == 'Google Drive - Virus scan warning':
-            driver.find_element_by_id("uc-download-link").click()
-            self.wait_until_download_completed(driver)
-            print("Done. Bring the next file on!\n")
-        elif driver.title == '':
-            print("Done. Bring the next file on!\n")
-        else:
-            try:
-                error_code = driver.find_element_by_class_name("error-code")
-                print(error_code.Text + " moving on to the next request")
-            except NoSuchElementException:
-                print('Reached the page {0}. Download not successful, moving on'.format(driver.title))
+
+        if not self.is_page_valid(driver):
+            return
+
+        # if reached to download page, handle it
+        self.handle_download_page(driver)
+
+        # if reached to virus check page, handle it
+        self.handle_virus_check_page(driver)
+
+        # wait downloading
+        self.wait_until_download_completed(driver)
+        print("Done. Bring the next file on!\n")
 
         driver.quit()
+
+    def handle_virus_check_page(self, driver):
+
+        for handle in driver.window_handles:
+            driver.switch_to_window(handle)
+            if driver.title == 'Google Drive - Virus scan warning':
+                try:
+                    driver.find_element_by_id("uc-download-link").click()
+                    return
+                except NoSuchElementException:
+                    print("Download link not found, continue..")
+        print('Virus check page not reached')
+
+
+    def handle_download_page(self, driver):
+
+        if driver.title.find("- Google Drive") != -1:
+            try:
+                driver.find_elements_by_xpath("//*[contains(text(), 'Download')]")[0].click()
+            except NoSuchElementException:
+                print("Download Button not found by css_selector, continue..")
+
+    def is_page_valid(self, driver):
+
+        # page title says Not Found return
+        if driver.title == 'Not Found':
+            print("Page Not Found: moving on to the next request...\n")
+            return False
+
+        # if error-code object is seen return false
+        try:
+            error_code = driver.find_element_by_class_name("error-code")
+            print("Err: " + error_code.Text + " moving on to the next request\n")
+        except NoSuchElementException:
+            pass
+
+        # if loaded empty page
+        if driver.title == '':
+            print("Reached empty page. moving on to the next request!\n")
+
+        return True
+
 
     def wait_until_download_completed(self, driver):
         maxTime = 600  # 10분 timeout
