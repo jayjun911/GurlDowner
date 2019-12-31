@@ -1,19 +1,28 @@
 import os
+import sys
 import time
+import os.path
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.wait import WebDriverWait
 
 
 class GurlDownSelenium:
 
-    def __init__(self):
+    def __init__(self, headless_option):
+        self.timedout_list = []
+        self.failed_list = []
         self.url = None
+        self.download_location = None
+        self.headless = headless_option
 
     def set_url(self, url):
         self.url = url
         return self
+
+    def set_download_location(self, location):
+        self.download_location = location
+        if not self.download_location:
+            self.download_location = self.get_download_path()
 
     def download_file(self):
         if os.name == 'nt':
@@ -23,20 +32,37 @@ class GurlDownSelenium:
             chrome_path = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
             chrome_driver_path = './chromedriver'
 
-        WINDOW_SIZE = "1024,768"
+        WINDOW_SIZE = "1024,700"
 
-        chrome_options = Options()
-        # chrome_options.add_argument("--headless")
+        chrome_options = webdriver.ChromeOptions()
+        if self.headless:
+            chrome_options.add_argument("--headless")
+        if self.download_location:
+            prefs = {
+                "download.default_directory": self.download_location,
+                "download.prompt_for_download": False,
+                "download.directory_upgrade": True
+            }
+            chrome_options.add_experimental_option('prefs', prefs)
         chrome_options.add_argument("--window-size=%s" % WINDOW_SIZE)
         chrome_options.binary_location = chrome_path
 
         driver = webdriver.Chrome(executable_path=chrome_driver_path,
                                   chrome_options=chrome_options
                                   )
+        # driver.minimize_window()
         driver.get(self.url)
 
+        if self.download_location:
+            self.enable_download_in_headless_chrome(driver, self.download_location)
+        else:
+            self.enable_download_in_headless_chrome(driver, self.get_download_path())
+
         if not self.is_page_valid(driver):
+            self.failed_list.append(self.url)
+            driver.quit()
             return
+        self.cleanup_download_location()
 
         # if reached to download page, handle it
         self.handle_download_page(driver)
@@ -45,8 +71,14 @@ class GurlDownSelenium:
         self.handle_virus_check_page(driver)
 
         # wait downloading
-        self.wait_until_download_completed(driver)
-        print("Done. Bring the next file on!\n")
+        if self.headless:
+            state = self.wait_until_download_completed_headless(driver)
+        else:
+            state = self.wait_until_download_completed(driver)
+
+        if state:
+            sys.stdout.write("\rDownloaded completed, Moving on to the next file")
+            sys.stdout.flush()
 
         driver.quit()
 
@@ -61,7 +93,6 @@ class GurlDownSelenium:
                 except NoSuchElementException:
                     print("Download link not found, continue..")
         print('Virus check page not reached')
-
 
     def handle_download_page(self, driver):
 
@@ -91,9 +122,67 @@ class GurlDownSelenium:
 
         return True
 
+    #
+    # def wait_until_download_completed_headless(self, driver, file_path):
+    #     while not os.path.exists(file_path):
+    #         time.sleep(1)
+    #
+    #     if os.path.isfile(file_path):
+    #         return 100
+    #     else:
+    #         raise ValueError("%s isn't a file!" % file_path)
+
+    # Headless Chrome disables downloads by default (at least as of 2017).
+    # https://stackoverflow.com/questions/45631715/downloading-with-chrome-headless-and-selenium
+    def enable_download_in_headless_chrome(self, driver, download_dir):
+        driver.command_executor._commands["send_command"] = ("POST", '/session/$sessionId/chromium/send_command')
+        params = {'cmd': 'Page.setDownloadBehavior',
+                  'params': {'behavior': 'allow', 'downloadPath': download_dir}}
+        command_result = driver.execute("send_command", params)
+
+    def get_top_download_state(self, driver):
+        """Call this after running driver.get("chrome://downloads")."""
+
+        [state, progress] = driver.execute_script("""
+        var item = downloads.Manager.get().items_[0];
+        var state = item.state;        
+        var progress = item.progressStatusText;
+        return [state, progress];
+        """)
+
+        return state, progress
+
+    def wait_until_download_completed_headless(self, driver):
+        maxTime = 60  # 1분 timeout
+        endTime = time.time() + maxTime
+        time.sleep(2)
+        sum_before = -1
+
+        while True:
+            # if download in progress
+            sum_after = sum([os.stat(os.path.join(self.download_location, file)).st_size for file in
+                             os.listdir(self.download_location)])
+            if sum_before != sum_after:
+                sum_before = sum_after
+                crd_size = sum([os.stat(os.path.join(self.download_location, file)).st_size for file in os.listdir(self.download_location) if file.endswith("crdownload")]) / 1024
+                sys.stdout.write("\rDownload Progress {:.2f} KB".format(crd_size))
+                sys.stdout.flush()
+                endTime = time.time() + maxTime  # time out extend
+
+            time.sleep(0.5)
+            crd_size = [os.stat(os.path.join(self.download_location, file)).st_size for file in os.listdir(self.download_location) if
+                        file.endswith("crdownload")]
+
+            if len(crd_size) == 0:
+                return True
+
+            if time.time() > endTime:
+                self.timedout_list.append(self.url)
+                print('Download timed out')
+                return False
 
     def wait_until_download_completed(self, driver):
-        maxTime = 600  # 10분 timeout
+        maxTime = 60  # 1분 timeout
         driver.execute_script("window.open()")
         # switch to new tab
         driver.switch_to.window(driver.window_handles[-1])
@@ -104,16 +193,61 @@ class GurlDownSelenium:
         while True:
             try:
                 # get the download percentage
-                downloadPercentage = driver.execute_script(
-                    "return document.querySelector('downloads-manager').shadowRoot.querySelector('#downloadsList downloads-item').shadowRoot.querySelector('#progress').value")
-                # check if downloadPercentage is 100 (otherwise the script will keep waiting)
-                if downloadPercentage == 100:
-                    # exit the method once it's completed
-                    return downloadPercentage
+                status, progress = self.get_top_download_state(driver)
+
+                if status == 'COMPLETE':
+                    return True
+                elif status == 'IN_PROGRESS':
+                    sys.stdout.write("\rDownload Progress {0}".format(progress))
+                    sys.stdout.flush()
+                    endTime = time.time() + maxTime
+                elif status == 'PAUSED':
+                    sys.stdout.write("\rPaused..")
+                    sys.stdout.flush()
+                    endTime = time.time() + maxTime # timeout extend
+                elif status == 'INTERRUPTED':
+                    sys.stdout.write("\rInterrupted! Wait...")
+                    sys.stdout.flush()
+                elif status == 'CANCELLED':
+                    print("Cancelled")
+                    self.failed_list.append(self.url)
+                    return False
             except:
                 pass
             # wait for 1 second before checking the percentage next time
             time.sleep(1)
             # exit method if the download not completed with in MaxTime.
             if time.time() > endTime:
-                break
+                self.timedout_list.append(self.url)
+                print('Download timed out')
+                return False
+
+    def save_log(self):
+        if len(self.failed_list) > 0:
+            f = open("failed.txt", "w+")
+            f.write("\n".join(self.failed_list))
+
+        if len(self.timedout_list) > 0:
+            f = open("timed_out.txt", "w+")
+            f.write("\n".join(self.timedout_list))
+
+    def get_download_path(self):
+        """Returns the default downloads path for linux or windows"""
+        if os.name == 'nt':
+            import winreg
+            sub_key = r'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders'
+            downloads_guid = '{374DE290-123F-4565-9164-39C4925E467B}'
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_key) as key:
+                location = winreg.QueryValueEx(key, downloads_guid)[0]
+            return location
+        else:
+            return os.path.join(os.path.expanduser('~'), 'downloads')
+
+    def cleanup_download_location(self):
+        crdfiles = [file for file in os.listdir(self.download_location) if file.endswith("crdownload")]
+        try:
+            for file in crdfiles:
+                os.remove(os.path.join(self.download_location, file))
+        except PermissionError:
+            print("crdlownload is being used {0}".format(file))
+
